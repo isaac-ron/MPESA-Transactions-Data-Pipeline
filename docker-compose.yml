@@ -1,0 +1,38 @@
+# Stage 1 infrastructure: a Postgres warehouse plus Adminer (a web UI for browsing it).
+# Airflow is added to this file in Stage 4.
+#
+#   docker compose up -d      -> start everything in the background
+#   docker compose ps         -> check that both services are healthy
+#   docker compose down       -> stop (your data survives in the pg_data volume)
+#   docker compose down -v    -> stop AND delete the data (a clean slate)
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: mpesa_postgres
+    environment:
+      POSTGRES_USER: ${PG_USER:-de_user}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-de_pass}
+      POSTGRES_DB: ${PG_DB:-mpesa_dw}
+    ports:
+      # host:container. Set PG_PORT=5433 in .env if Postgres already runs on your laptop.
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-de_user} -d ${PG_DB:-mpesa_dw}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  adminer:
+    image: adminer:4
+    container_name: mpesa_adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pg_data:
