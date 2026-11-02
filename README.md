@@ -27,7 +27,7 @@ flowchart LR
 
 ## Running Stage 1
 
-You need Docker Desktop and Python 3.10 or newer.
+You need Docker Desktop and [uv](https://docs.astral.sh/uv/) (uv installs Python 3.13 for you if it's missing).
 
 ```bash
 # 1. Start Postgres and Adminer
@@ -35,20 +35,21 @@ cp .env.example .env              # set PG_PORT=5433 here if 5432 is taken
 docker compose up -d
 docker compose ps                 # wait until postgres shows "healthy"
 
-# 2. Python environment
-python -m venv .venv
-source .venv/bin/activate         # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+# 2. Python environment (creates .venv from pyproject.toml + uv.lock)
+uv sync
 
 # 3. Run the pipeline
-python -m mpesa_pipeline generate     # 30 days of data -> data/landing/
-python -m mpesa_pipeline init-db      # create schemas + tables
-python -m mpesa_pipeline ingest       # load everything into raw.*
-python -m mpesa_pipeline ingest       # run it again: everything is SKIPPED
+uv run mpesa-pipeline generate     # 30 days of data -> data/landing/
+uv run mpesa-pipeline init-db      # create schemas + tables
+uv run mpesa-pipeline ingest       # load everything into raw.*
+uv run mpesa-pipeline ingest       # run it again: everything is SKIPPED
 
 # 4. Tests
-pytest -v
+uv run pytest -v
 ```
+
+`python -m mpesa_pipeline <command>` still works inside an activated `.venv`.
+Without uv, `pip install -r requirements.txt` works too.
 
 Then open **http://localhost:8080** (Adminer):
 - System: `PostgreSQL`
