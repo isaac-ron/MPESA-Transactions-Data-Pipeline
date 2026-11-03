@@ -3,6 +3,8 @@
     python -m mpesa_pipeline generate --days 30
     python -m mpesa_pipeline init-db
     python -m mpesa_pipeline ingest
+    python -m mpesa_pipeline build-staging
+    python -m mpesa_pipeline check
 """
 import argparse
 import logging
@@ -30,6 +32,9 @@ def main() -> None:
     i = sub.add_parser("ingest", help="load landing-zone files into the raw schema")
     i.add_argument("--landing-dir", default=str(LANDING_DIR))
 
+    sub.add_parser("build-staging", help="rebuild the staging schema from raw, then run the quality checks")
+    sub.add_parser("check", help="run the data quality checks only")
+
     args = parser.parse_args()
 
     if args.command == "generate":
@@ -41,6 +46,13 @@ def main() -> None:
     elif args.command == "ingest":
         from .ingest import ingest_all
         ingest_all(args.landing_dir)
+    elif args.command == "build-staging":
+        from .staging import build_staging, run_checks
+        build_staging()
+        run_checks()
+    elif args.command == "check":
+        from .staging import run_checks
+        run_checks()
 
 
 if __name__ == "__main__":
