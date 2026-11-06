@@ -38,6 +38,12 @@ def run_sql_file(conn, path: Path) -> None:
         cur.execute(path.read_text())
 
 
+def run_sql_dir(conn, directory: Path) -> None:
+    """Run every .sql file in a folder, in file-name order (10_..., 20_...)."""
+    for path in sorted(directory.glob("*.sql")):
+        run_sql_file(conn, path)
+
+
 def init_db(cfg: DBConfig | None = None) -> None:
     """Run every sql/NN_*.sql file in numeric order.
 

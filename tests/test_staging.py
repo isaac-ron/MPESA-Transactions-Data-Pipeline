@@ -5,8 +5,9 @@ hard-coded count, so these pass for any seed or dataset size.
 """
 import pytest
 
+from mpesa_pipeline.checks import DataQualityError, run_checks
 from mpesa_pipeline.ingest import ingest_all
-from mpesa_pipeline.staging import DataQualityError, build_staging, run_checks
+from mpesa_pipeline.staging import build_staging
 
 from .conftest import query_one
 
@@ -103,7 +104,7 @@ def test_day_first_dates_without_seconds(staged):
 
 def test_checks_pass_on_generated_data(staged):
     cfg, _, _, _ = staged
-    assert set(run_checks(cfg).values()) == {0}
+    assert set(run_checks("staging", cfg).values()) == {0}
 
 
 def test_rebuild_is_idempotent(staged):
@@ -131,4 +132,4 @@ def test_quarantine_rate_check_fails_the_run(clean_db, landing):
                         "RETURNING 1")
     build_staging(clean_db)
     with pytest.raises(DataQualityError, match="quarantine_rate"):
-        run_checks(clean_db)
+        run_checks("staging", clean_db)

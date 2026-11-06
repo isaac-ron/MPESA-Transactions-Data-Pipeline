@@ -21,7 +21,7 @@ flowchart LR
 |---|---|---|
 | **1. Ingest** (done) | Data generator, raw layer, idempotent loader | Landing zone, data contracts, idempotency, atomic loads, lineage, full refresh vs incremental |
 | **2. Clean** (done) | `staging` tables, cleaning rules, quality checks graded against the answer key | Type casting, deduplication, normalisation, late-arriving data, quarantine, data quality tests |
-| 3. Model | `warehouse` star schema: `fact_transactions` + date/shop/customer dims | Dimensional modelling, surrogate keys, grain, SCD, analytical SQL |
+| **3. Model** (done) | `warehouse` star schema: `fact_transactions` + date/shop/customer dims | Dimensional modelling, surrogate keys, grain, SCD, analytical SQL |
 | 4. Orchestrate | Airflow in Docker Compose, a daily DAG | DAGs, task dependencies, retries, backfills, scheduling |
 | 5. Harden | End-to-end tests, a dashboard, a write-up | Monitoring, documentation, portfolio presentation |
 
@@ -90,9 +90,46 @@ How it works:
 - **Quarantine, don't delete:** rows that fail a rule go to `staging.mpesa_transactions_quarantine` exactly as they arrived, with a `reasons TEXT[]` listing every rule they broke.
 - **Orphan tills are kept**, flagged `is_orphan_till`. The payment is real; only the shop master is missing a row. Dropping them would under-report revenue. Stage 3 maps them to an "Unknown shop" dimension row.
 - **Timestamps are plain `TIMESTAMP`** (Nairobi wall-clock time), so the session time zone can't shift them. `DD/MM/YYYY HH:MI` is read day-first and has no seconds (they become `:00`).
-- **Checks** (`sql/checks/`) are queries that return the rows breaking a rule. Zero rows means pass. They fail the command if rows go missing, a reversal points nowhere, or a quarantine reason jumps above 2% (a sign the source changed format).
+- **Checks** (`sql/checks/staging/`) are queries that return the rows breaking a rule. Zero rows means pass. They fail the command if rows go missing, a reversal points nowhere, or a quarantine reason jumps above 2% (a sign the source changed format).
 
 Explore it in Adminer: `SELECT * FROM staging.mpesa_transactions_quarantine;`, then trace any row back with `_source_file` / `_source_row`.
+
+## Running Stage 3
+
+```bash
+uv run mpesa-pipeline init-db           # adds the warehouse tables (safe to re-run)
+uv run mpesa-pipeline build-warehouse   # build the star schema from staging, then run its checks
+uv run mpesa-pipeline check             # every layer's checks (or --layer warehouse)
+```
+
+Expected with the default seed:
+
+```
+Warehouse built: 20416 facts (81 on Unknown shop), 1984 customers, 25 shops (25 versions), 31 dates
+```
+
+```
+                    dim_date
+                       |
+     dim_shop ---- fact_transactions ---- dim_customer
+```
+
+| Table | Grain (one row per...) | Load pattern |
+|---|---|---|
+| `fact_transactions` | receipt | Full rebuild from staging, looking up each dimension's surrogate key |
+| `dim_date` | calendar day (whole months, sales or not) | Generated; missing days inserted |
+| `dim_shop` | version of a shop | **SCD Type 2**: a changed shop gets a new version; old sales keep the old one. Never truncated: the history exists nowhere else |
+| `dim_customer` | phone number | **SCD Type 1** upsert: latest name overwrites, keys stay stable |
+
+Orphan-till transactions point at `shop_key = 0`, "Unknown shop", so revenue totals stay complete.
+If the shop master later lists that till, the next build moves those facts to the real shop.
+
+Then try the queries in `sql/queries/stage3_analytics.sql`.
+
+### Experiments worth trying
+1. **SCD Type 2:** in `data/landing/shops.csv`, change one shop's `Town`. Run `ingest` (only `shops.csv` reloads), `build-staging`, `build-warehouse`. Query 9 in `stage3_analytics.sql` now shows two versions of that shop: the old one closed at the moment the new snapshot was ingested, the new one current. October's sales still report under the old town.
+2. **Late-arriving dimension:** pick an orphan till (`SELECT DISTINCT till_number FROM staging.mpesa_transactions WHERE is_orphan_till`), add a row for it to `shops.csv`, and rerun the three commands. Its transactions leave "Unknown shop".
+3. **Why INNER JOIN is dangerous:** in `40_fact_transactions.sql`, change `LEFT JOIN warehouse.dim_shop` to `JOIN warehouse.dim_shop` and run `build-warehouse`. The build itself succeeds, but the 81 orphan transactions have silently vanished; only `warehouse/01_fact_reconciles_with_staging` notices and fails the run. Change it back afterwards.
 
 ## Project layout
 
@@ -102,10 +139,13 @@ mpesa_pipeline/        Python package (each pipeline step is a module)
   db.py                connections, transactions, migrations
   generate.py          synthetic source system with planted data issues
   ingest.py            Stage 1 loader
-  staging.py           Stage 2 runner: builds staging, runs quality checks
+  staging.py           Stage 2 runner: builds staging
+  warehouse.py         Stage 3 runner: builds the star schema
+  checks.py            runs the data quality checks for a layer
 sql/                   numbered migrations (run in order by init-db)
   staging/             Stage 2 transforms: raw -> staging (run in order by build-staging)
-  checks/              data quality checks: each returns its failing rows
+  warehouse/           Stage 3 transforms: staging -> star schema (run in order by build-warehouse)
+  checks/<layer>/      data quality checks: each returns its failing rows
   queries/             analysis / profiling queries
 tests/                 pytest; DB tests use a separate mpesa_dw_test database
 data/landing/          where source files arrive (git-ignored)

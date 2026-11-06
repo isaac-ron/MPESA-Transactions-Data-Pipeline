@@ -4,12 +4,14 @@
     python -m mpesa_pipeline init-db
     python -m mpesa_pipeline ingest
     python -m mpesa_pipeline build-staging
-    python -m mpesa_pipeline check
+    python -m mpesa_pipeline build-warehouse
+    python -m mpesa_pipeline check [--layer staging|warehouse]
 """
 import argparse
 import logging
 from datetime import date
 
+from .checks import LAYERS, DataQualityError, run_checks
 from .config import LANDING_DIR
 
 
@@ -33,7 +35,9 @@ def main() -> None:
     i.add_argument("--landing-dir", default=str(LANDING_DIR))
 
     sub.add_parser("build-staging", help="rebuild the staging schema from raw, then run the quality checks")
-    sub.add_parser("check", help="run the data quality checks only")
+    sub.add_parser("build-warehouse", help="build the star schema from staging, then run its quality checks")
+    c = sub.add_parser("check", help="run the data quality checks only")
+    c.add_argument("--layer", choices=LAYERS, help="one layer only (default: all)")
 
     args = parser.parse_args()
 
@@ -47,12 +51,22 @@ def main() -> None:
         from .ingest import ingest_all
         ingest_all(args.landing_dir)
     elif args.command == "build-staging":
-        from .staging import build_staging, run_checks
+        from .staging import build_staging
         build_staging()
-        run_checks()
+        run_checks("staging")
+    elif args.command == "build-warehouse":
+        from .warehouse import build_warehouse
+        build_warehouse()
+        run_checks("warehouse")
     elif args.command == "check":
-        from .staging import run_checks
-        run_checks()
+        failed = []
+        for layer in [args.layer] if args.layer else LAYERS:
+            try:
+                run_checks(layer)
+            except DataQualityError as exc:
+                failed.append(str(exc))
+        if failed:
+            raise DataQualityError("; ".join(failed))
 
 
 if __name__ == "__main__":
