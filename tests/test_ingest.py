@@ -1,5 +1,6 @@
 """Ingestion tests: each one checks a guarantee from the docstring in ingest.py."""
 import csv
+from datetime import date, timedelta
 
 import pytest
 
@@ -87,3 +88,19 @@ def test_every_raw_row_traces_back_to_its_source_line(clean_db, landing):
                         "SELECT receipt_no FROM raw.mpesa_transactions "
                         "WHERE _source_file = %s AND _source_row = %s", (name, line_no))
     assert receipt == rows[line_no - 1][0]
+
+
+def test_single_day_loads_only_that_days_file(clean_db, landing):
+    # What one daily Airflow run does: the shops snapshot plus one transaction file.
+    out, report = landing
+    day = date.fromisoformat(report["start"]) + timedelta(days=1)
+    summary = ingest_all(out, clean_db, day=day)
+    assert sorted(summary["loaded"]) == ["mpesa_transactions_" + day.isoformat() + ".csv", "shops.csv"]
+    assert query_one(clean_db, "SELECT COUNT(DISTINCT _source_file) FROM raw.mpesa_transactions") == 1
+
+
+def test_single_day_with_missing_file_is_an_error(clean_db, landing):
+    out, _ = landing
+    with pytest.raises(FileNotFoundError, match="2030-01-01"):
+        ingest_all(out, clean_db, day=date(2030, 1, 1))
+    assert query_one(clean_db, "SELECT COUNT(*) FROM raw.ingestion_log") == 0

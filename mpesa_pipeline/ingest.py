@@ -25,6 +25,7 @@ import csv
 import hashlib
 import logging
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 from .config import LANDING_DIR, DBConfig
@@ -41,6 +42,7 @@ class SourceSpec:
     table: str              # raw table they load into
     header_map: dict        # source header -> raw column (this IS the data contract)
     mode: str               # "append" (incremental) or "replace" (full refresh)
+    daily_file: str | None = None  # the one file for a given day; None = not split by day
 
 
 SOURCES = [
@@ -63,6 +65,7 @@ SOURCES = [
             "customer_name", "amount", "transaction_type", "linked_receipt_no",
         ])),
         mode="append",
+        daily_file="mpesa_transactions_{day}.csv",
     ),
 ]
 
@@ -146,17 +149,34 @@ def ingest_file(conn, path: Path, spec: SourceSpec) -> int | None:
     return n_rows
 
 
-def ingest_all(landing_dir: Path = LANDING_DIR, cfg: DBConfig | None = None) -> dict:
+def daily_file(day: date, landing_dir: Path = LANDING_DIR) -> Path:
+    """Where the transaction export for one business day is expected to land."""
+    spec = next(s for s in SOURCES if s.daily_file)
+    return Path(landing_dir) / spec.daily_file.format(day=day.isoformat())
+
+
+def ingest_all(landing_dir: Path = LANDING_DIR, cfg: DBConfig | None = None, day: date | None = None) -> dict:
     """Ingest every file in the landing zone, one transaction per file.
+
+    With `day`, only that day's transaction file is loaded (plus the shops
+    snapshot). That's what one daily Airflow run does. A missing file for that
+    day is an error, not "nothing to do".
 
     A bad file does not stop the good ones. The failures are collected and
     raised together at the end, so the run still shows up as failed (and an
     orchestrator like Airflow will alert on it) while every good file loads.
     """
     landing_dir = Path(landing_dir)
+    if day is not None and not daily_file(day, landing_dir).exists():
+        raise FileNotFoundError(f"No transaction file for {day}: expected {daily_file(day, landing_dir)}")
+
     summary = {"loaded": {}, "skipped": [], "failed": {}}
     for spec in SOURCES:
-        for path in sorted(landing_dir.glob(spec.pattern)):
+        if day is not None and spec.daily_file:
+            paths = [daily_file(day, landing_dir)]
+        else:
+            paths = sorted(landing_dir.glob(spec.pattern))
+        for path in paths:
             try:
                 with transaction(cfg) as conn:
                     n = ingest_file(conn, path, spec)

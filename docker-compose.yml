@@ -1,10 +1,11 @@
-# Stage 1 infrastructure: a Postgres warehouse plus Adminer (a web UI for browsing it).
-# Airflow is added to this file in Stage 4.
+# Infrastructure: a Postgres warehouse, Adminer (a web UI for browsing it), and,
+# from Stage 4, Airflow to run the pipeline on a schedule.
 #
-#   docker compose up -d      -> start everything in the background
-#   docker compose ps         -> check that both services are healthy
-#   docker compose down       -> stop (your data survives in the pg_data volume)
-#   docker compose down -v    -> stop AND delete the data (a clean slate)
+#   docker compose up -d                     -> warehouse + Adminer only
+#   docker compose --profile airflow up -d   -> ...plus Airflow (http://localhost:8081)
+#   docker compose ps                        -> check that services are healthy
+#   docker compose --profile airflow down    -> stop everything (data survives in the volumes)
+#   docker compose --profile airflow down -v -> stop AND delete all data (a clean slate)
 
 services:
   postgres:
@@ -34,5 +35,61 @@ services:
       postgres:
         condition: service_healthy
 
+  # ---------- Stage 4: orchestration (only started with --profile airflow) ----------
+
+  # Airflow's own metadata database: DAG runs, task states, logs index, etc.
+  # Kept separate from the warehouse on purpose: the orchestrator's bookkeeping
+  # and the business data have different owners, backups and lifecycles.
+  airflow-db:
+    image: postgres:16
+    container_name: mpesa_airflow_db
+    profiles: ["airflow"]
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # All of Airflow (API server + UI, scheduler, DAG processor, triggerer) in one
+  # container via `airflow standalone`. Fine for learning on a laptop; production
+  # runs each component as its own service so they can scale and fail independently.
+  airflow:
+    image: apache/airflow:3.4.0-python3.13
+    container_name: mpesa_airflow
+    profiles: ["airflow"]
+    command: standalone
+    ports:
+      - "8081:8080"          # 8080 on the host is already Adminer
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/mpesa-pipeline/dags
+      # Local learning setup: no login screen. Never do this on a shared server.
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "True"
+      # The pipeline code is mounted, not installed: tasks import it from here.
+      PYTHONPATH: /opt/mpesa-pipeline
+      # Same code as on your laptop, different environment (config.py reads these).
+      # Inside Docker's network the warehouse is "postgres:5432", whatever the host port is.
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DB: ${PG_DB:-mpesa_dw}
+      PG_USER: ${PG_USER:-de_user}
+      PG_PASSWORD: ${PG_PASSWORD:-de_pass}
+    volumes:
+      - .:/opt/mpesa-pipeline
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-db:
+        condition: service_healthy
+
 volumes:
   pg_data:
+  airflow_db:

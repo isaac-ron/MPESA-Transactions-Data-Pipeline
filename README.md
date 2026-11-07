@@ -22,7 +22,7 @@ flowchart LR
 | **1. Ingest** (done) | Data generator, raw layer, idempotent loader | Landing zone, data contracts, idempotency, atomic loads, lineage, full refresh vs incremental |
 | **2. Clean** (done) | `staging` tables, cleaning rules, quality checks graded against the answer key | Type casting, deduplication, normalisation, late-arriving data, quarantine, data quality tests |
 | **3. Model** (done) | `warehouse` star schema: `fact_transactions` + date/shop/customer dims | Dimensional modelling, surrogate keys, grain, SCD, analytical SQL |
-| 4. Orchestrate | Airflow in Docker Compose, a daily DAG | DAGs, task dependencies, retries, backfills, scheduling |
+| **4. Orchestrate** (done) | Airflow in Docker Compose, a daily DAG | DAGs, task dependencies, retries, backfills, scheduling |
 | 5. Harden | End-to-end tests, a dashboard, a write-up | Monitoring, documentation, portfolio presentation |
 
 ## Running Stage 1
@@ -131,6 +131,55 @@ Then try the queries in `sql/queries/stage3_analytics.sql`.
 2. **Late-arriving dimension:** pick an orphan till (`SELECT DISTINCT till_number FROM staging.mpesa_transactions WHERE is_orphan_till`), add a row for it to `shops.csv`, and rerun the three commands. Its transactions leave "Unknown shop".
 3. **Why INNER JOIN is dangerous:** in `40_fact_transactions.sql`, change `LEFT JOIN warehouse.dim_shop` to `JOIN warehouse.dim_shop` and run `build-warehouse`. The build itself succeeds, but the 81 orphan transactions have silently vanished; only `warehouse/01_fact_reconciles_with_staging` notices and fails the run. Change it back afterwards.
 
+## Running Stage 4
+
+Airflow runs the pipeline once per business day. It needs about 2 GB of the memory Docker Desktop is allowed to use.
+
+```bash
+docker compose --profile airflow up -d     # adds Airflow + its own metadata database
+```
+
+Open **http://localhost:8081** (no login in this local setup). The `mpesa_daily` DAG starts **paused**.
+
+```
+wait_for_file -> ingest -> build_staging -> check_staging -> build_warehouse -> check_warehouse
+```
+
+| Task | What it does |
+|---|---|
+| `wait_for_file` | Sensor: waits up to 6 h for `mpesa_transactions_<day>.csv` to land (checks every minute, without holding a worker slot) |
+| `ingest` | Loads only that day's file, plus the shops snapshot |
+| `build_staging` / `build_warehouse` | The Stage 2 / Stage 3 builds |
+| `check_staging` / `check_warehouse` | Quality gates. A failure stops the run immediately, with no retries, *before* the next layer is touched |
+
+Load the history with a **backfill**. The DAG must be unpaused, because Airflow 3 doesn't run backfill runs for a paused DAG:
+
+```bash
+docker exec mpesa_airflow airflow dags unpause mpesa_daily
+docker exec mpesa_airflow airflow backfill create --dag-id mpesa_daily \
+    --from-date 2026-10-01T00:00:00+03:00 --to-date 2026-10-30T00:00:00+03:00 --max-active-runs 1
+```
+
+Give the dates **with the `+03:00` offset**. A bare `2026-10-01` is read as UTC midnight, which is 03:00 in Nairobi, so the backfill would start at the *next* Nairobi midnight and silently skip 1 October.
+
+Unpausing also starts the normal schedule: Airflow creates a run for the latest complete day, whose sensor waits for a file that doesn't exist yet. That's the pipeline doing its job: waiting for today's export. Pause the DAG again when you're done.
+
+Re-running is safe. If the files are already in `raw`, ingest logs `SKIP` and the rebuilds produce identical tables.
+
+Stop Airflow (and free its memory) with `docker compose --profile airflow stop airflow airflow-db`.
+
+### Experiments worth trying
+1. **A backfill from empty:** in Adminer run `DROP SCHEMA raw, staging, warehouse CASCADE;`, then `uv run mpesa-pipeline init-db`, then backfill 1-5 Oct. After each run, `SELECT MIN(date_key), MAX(date_key), COUNT(*) FROM warehouse.fact_transactions` grows by a day. Then run `generate`, `ingest`, `build-staging` and `build-warehouse` to get the full month back.
+2. **Late data changes "finished" days:** after the 2 Oct run, check 1 Oct's revenue in query 1 of `stage3_analytics.sql`. It went *up*: the 2 Oct file contained late 1 Oct sales. Each run's full rebuild handles this automatically.
+3. **A failing quality gate:** damage one day in raw with `UPDATE raw.mpesa_transactions SET amount = '' WHERE _source_file = 'mpesa_transactions_2026-10-05.csv';` (the whole day: enough to push the quarantine rate past the 2% tolerance), then trigger the DAG for 5 Oct (Trigger, with logical date `2026-10-05T00:00:00+03:00`). `check_staging` fails (red), `build_warehouse` never runs ("upstream failed"), and the task log shows the `ALERT` line. The warehouse keeps its last good contents. To undo: `DELETE FROM raw.ingestion_log WHERE file_name = 'mpesa_transactions_2026-10-05.csv';` (the file itself is unchanged, so without this the manifest says "already loaded"), then run `ingest`, `build-staging` and `build-warehouse`.
+4. **Retries:** `docker stop mpesa_postgres`, then trigger a run. `ingest` can't connect and goes to `up_for_retry` (yellow), with the next attempt in 1 minute. Run `docker start mpesa_postgres` within that minute and watch the retry succeed. Compare with experiment 3: a broken connection is worth retrying; broken data is not.
+
+DAG tests run inside the container (Airflow isn't installed on the host):
+
+```bash
+docker exec mpesa_airflow bash -c "pip install -q pytest && cd /opt/mpesa-pipeline && python -m pytest tests/test_dag.py -p no:cacheprovider"
+```
+
 ## Project layout
 
 ```
@@ -147,6 +196,7 @@ sql/                   numbered migrations (run in order by init-db)
   warehouse/           Stage 3 transforms: staging -> star schema (run in order by build-warehouse)
   checks/<layer>/      data quality checks: each returns its failing rows
   queries/             analysis / profiling queries
+dags/                  Airflow DAG: mpesa_daily.py (Stage 4)
 tests/                 pytest; DB tests use a separate mpesa_dw_test database
 data/landing/          where source files arrive (git-ignored)
 data/generation_report.json   answer key: how many of each issue were planted
